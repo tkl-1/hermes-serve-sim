@@ -1,0 +1,110 @@
+#!/bin/bash
+# simtest — quick iOS Simulator + serve-sim management.
+#   simtest on     → boot sim + open Simulator.app + start serve-sim (background)
+#   simtest off    → stop serve-sim (sim stays booted)
+#   simtest status → status summary
+#
+# Environment overrides (all optional):
+#   SIMTEST_UDID          — simulator device UDID (default: first available iPhone)
+#   SIMTEST_PORT          — serve-sim port (default: 3200)
+#   SIMTEST_HOST          — serve-sim bind address (default: 127.0.0.1 — loopback only.
+#                           serve-sim has NO auth; only set 0.0.0.0 if you explicitly
+#                           want LAN access, e.g. for tunneling)
+#   SIMTEST_DEVELOPER_DIR — DEVELOPER_DIR for the Xcode toolchain (default: system)
+#   SIMTEST_PIN           — serve-sim version to run (default: 0.1.45)
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+# Intel Macs too (no-op on Apple Silicon)
+[ -d /usr/local/bin ] && export PATH="/usr/local/bin:$PATH"
+
+if [ -n "$SIMTEST_DEVELOPER_DIR" ]; then
+  export DEVELOPER_DIR="$SIMTEST_DEVELOPER_DIR"
+fi
+
+UDID="${SIMTEST_UDID:-$(xcrun simctl list devices available 2>/dev/null | grep -m1 'iPhone' | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}')}"
+PORT="${SIMTEST_PORT:-3200}"
+HOST="${SIMTEST_HOST:-127.0.0.1}"
+PIN="${SIMTEST_PIN:-0.1.45}"
+PIDFILE="${TMPDIR:-/tmp}/serve-sim.pid"
+LOG="${TMPDIR:-/tmp}/serve-sim.log"
+
+if [ -z "$UDID" ]; then
+  echo "No iPhone simulator found. Boot one in Xcode first, or set SIMTEST_UDID." >&2
+  exit 1
+fi
+
+case "$1" in
+  on)
+    xcrun simctl boot "$UDID" 2>/dev/null && echo "Sim booted" || echo "Sim already booted"
+    open -a Simulator 2>/dev/null || true
+    xcrun simctl bootstatus "$UDID" -b 2>/dev/null | tail -1 >/dev/null
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+      echo "serve-sim already running (PID $(cat "$PIDFILE"))"
+    elif lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "serve-sim already running on port $PORT (no pidfile)"
+    else
+      # Serve-sim runs in its own process group so we can kill the whole tree
+      # (npx → node → serve-sim) without touching unrelated processes.
+      if command -v setsid >/dev/null 2>&1; then
+        nohup setsid npx serve-sim@"$PIN" --port "$PORT" --host "$HOST" >"$LOG" 2>&1 &
+      else
+        nohup npx serve-sim@"$PIN" --port "$PORT" --host "$HOST" >"$LOG" 2>&1 &
+      fi
+      SRV_PID=$!
+      echo "$SRV_PID" > "$PIDFILE"
+      # Readiness: first npx install can be slow — wait up to 45s.
+      READY=""
+      for _ in $(seq 1 45); do
+        if lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then READY=1; break; fi
+        sleep 1
+      done
+      if [ -n "$READY" ]; then
+        echo "serve-sim started (PID $SRV_PID, bound to $HOST:$PORT)"
+      else
+        echo "serve-sim failed to start — log: $LOG" >&2
+        # Kill the whole process group (setsid) or just the direct child.
+        kill -- -"$SRV_PID" 2>/dev/null || kill "$SRV_PID" 2>/dev/null
+        rm -f "$PIDFILE"
+        exit 1
+      fi
+    fi
+    echo "→ http://localhost:$PORT  (open it in a browser, or use the Hermes Sim pane)"
+    ;;
+  off)
+    if [ -f "$PIDFILE" ]; then
+      OLD_PID="$(cat "$PIDFILE" 2>/dev/null || echo '')"
+      if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        COMM="$(ps -o comm= -p "$OLD_PID" 2>/dev/null)"
+        case "$COMM" in
+          npm|node)
+            kill "$OLD_PID" 2>/dev/null
+            echo "serve-sim stopped (PID $OLD_PID)"
+            ;;
+          *)
+            echo "Warning: PID $OLD_PID ($COMM) is not serve-sim — not killed" >&2
+            ;;
+        esac
+      fi
+      rm -f "$PIDFILE"
+    fi
+    # If the port is still listening (orphaned node child): kill its owner —
+    # only one process can listen on a port, so this can't hit the wrong one.
+    LISTEN_PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null)"
+    if [ -n "$LISTEN_PIDS" ]; then
+      kill $LISTEN_PIDS 2>/dev/null
+      echo "serve-sim port $PORT listeners stopped"
+    fi
+    ;;
+  status)
+    echo "Sim: $(xcrun simctl list devices 2>/dev/null | grep "$UDID" | grep -oE 'Booted|Shutdown' | head -1)"
+    if curl -s -m 3 -o /dev/null -w "serve-sim: HTTP %{http_code}" "http://localhost:$PORT/" 2>/dev/null | grep -q 200; then
+      BIND="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+      echo "serve-sim: on (http://localhost:$PORT, PID ${BIND:-?})"
+    else
+      echo "serve-sim: off"
+    fi
+    ;;
+  *)
+    echo "Usage: simtest on | off | status"
+    ;;
+esac
